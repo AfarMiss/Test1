@@ -1,0 +1,1420 @@
+#!/usr/bin/env python3
+"""Generate Markdown reading views directly from Excel design docs.
+
+This script reads only the source xlsx package: worksheet XML, styles, merged
+cells, drawing anchors, and media parts.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import sys
+import tempfile
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+from PIL import Image
+
+
+ROOT = Path(__file__).resolve().parents[2]
+DOC_DIR = ROOT / ".codex" / "design-doc-analysis"
+SOURCE_ROOT = Path(r"D:\DaoGuangZhanShen\design\策划案")
+OUTPUT_ROOT = DOC_DIR / "all-design-md-v3"
+MD_LIST = DOC_DIR / "md-list.md"
+MAIN_SHEET_PATTERNS = ("界面&功能", "界面", "功能")
+
+NS = {
+    "a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    "a_dml": "http://schemas.openxmlformats.org/drawingml/2006/main",
+}
+REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+DOC_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+OD_REL_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+
+
+@dataclass
+class Cell:
+    ref: str
+    row: int
+    col: int
+    text: str
+    style: str | None
+    start_row: int
+    start_col: int
+    end_row: int
+    end_col: int
+    is_title: bool = False
+
+
+@dataclass
+class ImageItem:
+    index: int
+    source: str
+    path: str
+    from_row: int
+    from_col: int
+    to_row: int
+    to_col: int
+
+
+def configure_stdio() -> None:
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
+
+def col_to_num(col: str) -> int:
+    value = 0
+    for char in col:
+        value = value * 26 + ord(char) - 64
+    return value
+
+
+def num_to_col(value: int) -> str:
+    result = ""
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def cell_position(ref: str) -> tuple[int, int]:
+    match = re.match(r"([A-Z]+)(\d+)", ref or "")
+    if not match:
+        return (999999, 999999)
+    return int(match.group(2)), col_to_num(match.group(1))
+
+
+def range_bounds(ref: str) -> dict:
+    start, _, end = ref.partition(":")
+    if not end:
+        end = start
+    start_row, start_col = cell_position(start)
+    end_row, end_col = cell_position(end)
+    return {
+        "ref": ref,
+        "start_row": min(start_row, end_row),
+        "start_col": min(start_col, end_col),
+        "end_row": max(start_row, end_row),
+        "end_col": max(start_col, end_col),
+    }
+
+
+def text_from_si(node: ET.Element | None) -> str:
+    if node is None:
+        return ""
+    pieces = []
+    for text_node in node.findall(".//a:t", NS):
+        pieces.append(text_node.text or "")
+    return "".join(pieces)
+
+
+def normalize_text(value: str) -> str:
+    return re.sub(r"[ \t]+", " ", value.replace("\r", "\n")).strip()
+
+
+def is_dispimg_formula(value: str) -> bool:
+    normalized = value.strip()
+    if normalized.startswith("="):
+        normalized = normalized[1:].strip()
+    normalized = normalized.removeprefix("_xlfn.").strip()
+    return bool(re.fullmatch(r"DISPIMG\s*\(.*\)", normalized, flags=re.IGNORECASE))
+
+
+def resolve_part(base_part: str, target: str) -> str:
+    if target.startswith("/"):
+        return target.lstrip("/")
+    base = Path(base_part).parent
+    parts: list[str] = []
+    for part in (base / target).as_posix().split("/"):
+        if part == "..":
+            if parts:
+                parts.pop()
+        elif part and part != ".":
+            parts.append(part)
+    return "/".join(parts)
+
+
+def rels_path_for(part: str) -> str:
+    path = Path(part)
+    return (path.parent / "_rels" / f"{path.name}.rels").as_posix()
+
+
+def sheet_path_from_target(target: str) -> str:
+    target = target.lstrip("/")
+    if target.startswith("xl/"):
+        return target
+    return f"xl/{target}"
+
+
+def read_rels(zf: zipfile.ZipFile, rels_path: str) -> dict[str, str]:
+    if rels_path not in zf.namelist():
+        return {}
+    root = ET.fromstring(zf.read(rels_path))
+    return {rel.attrib["Id"]: rel.attrib["Target"] for rel in root.findall(f"{REL_NS}Relationship")}
+
+
+def read_shared_strings(zf: zipfile.ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in zf.namelist():
+        return []
+    root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+    return [text_from_si(si) for si in root.findall("a:si", NS)]
+
+
+def read_styles(zf: zipfile.ZipFile) -> dict[str, dict]:
+    if "xl/styles.xml" not in zf.namelist():
+        return {}
+    root = ET.fromstring(zf.read("xl/styles.xml"))
+    fonts_node = root.find("a:fonts", NS)
+    fills_node = root.find("a:fills", NS)
+    cell_xfs_node = root.find("a:cellXfs", NS)
+    fonts = list(fonts_node) if fonts_node is not None else []
+    fills = list(fills_node) if fills_node is not None else []
+    cell_xfs = list(cell_xfs_node) if cell_xfs_node is not None else []
+    features = {}
+    for index, xf in enumerate(cell_xfs):
+        font_id = int(xf.attrib.get("fontId", "0"))
+        fill_id = int(xf.attrib.get("fillId", "0"))
+        font = fonts[font_id] if font_id < len(fonts) else None
+        fill = fills[fill_id] if fill_id < len(fills) else None
+        size_node = font.find("a:sz", NS) if font is not None else None
+        bold_node = font.find("a:b", NS) if font is not None else None
+        pattern_node = fill.find("a:patternFill", NS) if fill is not None else None
+        pattern_type = pattern_node.attrib.get("patternType") if pattern_node is not None else None
+        features[str(index)] = {
+            "font_size": float(size_node.attrib["val"]) if size_node is not None and "val" in size_node.attrib else None,
+            "bold": bold_node is not None,
+            "filled": pattern_type not in (None, "none"),
+        }
+    return features
+
+
+def cell_text(cell: ET.Element, shared: list[str]) -> str:
+    formula_node = cell.find("a:f", NS)
+    formula = formula_node.text if formula_node is not None and formula_node.text else ""
+    text = ""
+    if cell.attrib.get("t") == "inlineStr":
+        text = text_from_si(cell.find("a:is", NS))
+    else:
+        value_node = cell.find("a:v", NS)
+        if value_node is not None and value_node.text is not None:
+            text = value_node.text
+            if cell.attrib.get("t") == "s":
+                try:
+                    text = shared[int(text)]
+                except (ValueError, IndexError):
+                    pass
+    if is_dispimg_formula(text) or is_dispimg_formula(formula):
+        return ""
+    if text:
+        return normalize_text(text.replace("\n", " "))
+    if formula:
+        return normalize_text(f"[formula] {formula}")
+    return ""
+
+
+def read_merged_ranges(root: ET.Element) -> list[dict]:
+    ranges = []
+    for node in root.findall(".//a:mergeCell", NS):
+        ref = node.attrib.get("ref")
+        if ref:
+            ranges.append(range_bounds(ref))
+    return ranges
+
+
+def merge_for_cell(row: int, col: int, merged_ranges: list[dict]) -> dict | None:
+    for merged in merged_ranges:
+        if merged["start_row"] <= row <= merged["end_row"] and merged["start_col"] <= col <= merged["end_col"]:
+            return merged
+    return None
+
+
+def parse_cells(root: ET.Element, shared: list[str], merged_ranges: list[dict]) -> list[Cell]:
+    cells = []
+    for node in root.findall(".//a:c", NS):
+        text = cell_text(node, shared)
+        if not text:
+            continue
+        ref = node.attrib.get("r", "")
+        row, col = cell_position(ref)
+        merged = merge_for_cell(row, col, merged_ranges)
+        bounds = merged or {"start_row": row, "start_col": col, "end_row": row, "end_col": col}
+        cells.append(
+            Cell(
+                ref=ref,
+                row=row,
+                col=col,
+                text=text,
+                style=node.attrib.get("s"),
+                start_row=bounds["start_row"],
+                start_col=bounds["start_col"],
+                end_row=bounds["end_row"],
+                end_col=bounds["end_col"],
+            )
+        )
+    return sorted(cells, key=lambda item: (item.row, item.col))
+
+
+def select_sheet(zf: zipfile.ZipFile) -> tuple[str, str]:
+    workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+    workbook_rels = read_rels(zf, "xl/_rels/workbook.xml.rels")
+    sheets = []
+    for sheet in workbook.find("a:sheets", NS):
+        name = sheet.attrib["name"]
+        rid = sheet.attrib.get(OD_REL_ID)
+        target = workbook_rels.get(rid or "")
+        if target:
+            sheets.append((name, sheet_path_from_target(target)))
+    for pattern in MAIN_SHEET_PATTERNS:
+        for name, path in sheets:
+            if pattern in name.strip():
+                return name, path
+    raise ValueError(f"no main sheet matched: {', '.join(MAIN_SHEET_PATTERNS)}")
+
+
+def convert_to_webp(zf: zipfile.ZipFile, source: str, target: Path) -> None:
+    suffix = Path(source).suffix.lower()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        raw = Path(tmp.name)
+        tmp.write(zf.read(source))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(raw) as image:
+            if image.mode not in ("RGB", "RGBA"):
+                image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+            image.save(target, "WEBP", quality=92, method=6)
+    finally:
+        raw.unlink(missing_ok=True)
+
+
+def drawing_images(zf: zipfile.ZipFile, sheet_path: str, output_dir: Path) -> list[ImageItem]:
+    root = ET.fromstring(zf.read(sheet_path))
+    sheet_rels = read_rels(zf, rels_path_for(sheet_path))
+    drawing_parts = []
+    for drawing in root.findall("a:drawing", NS):
+        rid = drawing.attrib.get(f"{DOC_REL_NS}id")
+        target = sheet_rels.get(rid or "")
+        if target:
+            drawing_parts.append(resolve_part(sheet_path, target))
+
+    raw_items = []
+    seen = set()
+    for drawing_part in drawing_parts:
+        drawing_rels = read_rels(zf, rels_path_for(drawing_part))
+        drawing_root = ET.fromstring(zf.read(drawing_part))
+        for anchor in list(drawing_root):
+            from_node = anchor.find("xdr:from", NS)
+            to_node = anchor.find("xdr:to", NS)
+            blip = anchor.find(".//a_dml:blip", NS)
+            if from_node is None or blip is None:
+                continue
+            rid = blip.attrib.get(f"{DOC_REL_NS}embed")
+            target = drawing_rels.get(rid or "")
+            if not target:
+                continue
+            source = resolve_part(drawing_part, target)
+            if not source.startswith("xl/media/"):
+                continue
+
+            def marker(node: ET.Element | None, name: str) -> int:
+                if node is None:
+                    return 0
+                child = node.find(f"xdr:{name}", NS)
+                return int(child.text) + 1 if child is not None and child.text is not None else 0
+
+            from_row = marker(from_node, "row")
+            from_col = marker(from_node, "col")
+            to_row = marker(to_node, "row") if to_node is not None else from_row
+            to_col = marker(to_node, "col") if to_node is not None else from_col
+            key = (source, from_row, from_col)
+            if key in seen:
+                continue
+            seen.add(key)
+            raw_items.append((from_row, from_col, to_row or from_row, to_col or from_col, source))
+
+    raw_items.sort(key=lambda item: (item[0], item[1], item[4]))
+    images = []
+    for index, (from_row, from_col, to_row, to_col, source) in enumerate(raw_items, start=1):
+        rel_path = f"image_{index}.webp"
+        convert_to_webp(zf, source, output_dir / rel_path)
+        images.append(ImageItem(index, source, rel_path, from_row, from_col, to_row, to_col))
+    return images
+
+
+def detect_titles(cells: list[Cell], styles: dict[str, dict]) -> list[Cell]:
+    counts: dict[str | None, int] = {}
+    for cell in cells:
+        counts[cell.style] = counts.get(cell.style, 0) + 1
+    sized = [
+        styles.get(style or "", {}).get("font_size")
+        for style in counts
+        if styles.get(style or "", {}).get("font_size") is not None
+    ]
+    body_size = min(sized) if sized else None
+    titles = []
+    for cell in cells:
+        feature = styles.get(cell.style or "", {})
+        size = feature.get("font_size")
+        if cell.row <= 1:
+            continue
+        if size is not None and body_size is not None and size > body_size and (feature.get("bold") or feature.get("filled")):
+            cell.is_title = True
+            titles.append(cell)
+    if not titles:
+        titles = fallback_titles(cells, styles, counts)
+    return sorted(titles, key=lambda item: (item.row, item.col))
+
+
+def fallback_titles(cells: list[Cell], styles: dict[str, dict], counts: dict[str | None, int]) -> list[Cell]:
+    titles: list[Cell] = []
+    for cell in cells:
+        if cell.row <= 1:
+            continue
+        text = cell.text.strip()
+        feature = styles.get(cell.style or "", {})
+        distinctive = feature.get("filled") or feature.get("bold") or counts.get(cell.style, 0) <= 8
+        short_left_cell = len(text) <= 32 and cell.start_col == cell.end_col and cell.start_col <= 5
+        following_rows = [
+            other
+            for other in cells
+            if cell.row < other.row <= cell.row + 5
+        ]
+        has_following_content = bool(following_rows)
+        if distinctive and short_left_cell and has_following_content:
+            cell.is_title = True
+            titles.append(cell)
+    return titles
+
+
+def title_lanes(titles: list[Cell]) -> list[int]:
+    bands: list[tuple[int, int]] = []
+    for title in sorted((item for item in titles if item.row > 1), key=lambda item: (item.start_col, item.end_col)):
+        placed = False
+        for index, (left, right) in enumerate(bands):
+            if horizontal_overlap(title.start_col, title.end_col, left, right) > 0:
+                bands[index] = (min(left, title.start_col), max(right, title.end_col))
+                placed = True
+                break
+        if not placed:
+            bands.append((title.start_col, title.end_col))
+    cols = sorted(left for left, _right in bands)
+    if not cols:
+        return [1]
+    return cols
+
+
+def lane_bounds_for_title(title: Cell, lanes: list[int]) -> tuple[int, int]:
+    lane = max((col for col in lanes if col <= title.start_col), default=lanes[0])
+    index = lanes.index(lane)
+    left = 1 if index == 0 else lane
+    right = lanes[index + 1] - 1 if index + 1 < len(lanes) else 999999
+    return left, right
+
+
+def horizontal_overlap(a_left: int, a_right: int, b_left: int, b_right: int) -> int:
+    return max(0, min(a_right, b_right) - max(a_left, b_left) + 1)
+
+
+def assign_to_title(
+    start_row: int,
+    start_col: int,
+    end_col: int,
+    titles: list[Cell],
+    lanes: list[int],
+) -> Cell | None:
+    candidates = []
+    for title in titles:
+        if title.row > start_row:
+            continue
+        left, right = lane_bounds_for_title(title, lanes)
+        overlap = horizontal_overlap(start_col, end_col, left, right)
+        if overlap <= 0:
+            continue
+        distance = 0 if start_col >= title.start_col else title.start_col - end_col
+        candidates.append((title.row, overlap, -abs(distance), title))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    return candidates[-1][3]
+
+
+def should_attach_to_right_title_prefix(cell: Cell, current_title: Cell, right_title: Cell) -> bool:
+    text = cell.text.strip()
+    if len(text) > 8:
+        return False
+    if not re.fullmatch(r"\d+[.、]?", text):
+        return False
+    same_row_right_cell = right_title.row == cell.row and right_title.start_col == cell.end_col + 1
+    before_right_title = cell.row > right_title.row and cell.end_col + 1 == right_title.start_col
+    return before_right_title and current_title.start_col < cell.start_col < right_title.start_col and not same_row_right_cell
+
+
+def adjacent_right_title_for_cell(cell: Cell, current_title: Cell, titles: list[Cell]) -> Cell | None:
+    candidates = [
+        title
+        for title in titles
+        if title.row <= cell.row
+        and title.start_col == cell.end_col + 1
+        and title.start_col > current_title.start_col
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item.row, item.start_col))
+    right_title = candidates[-1]
+    if should_attach_to_right_title_prefix(cell, current_title, right_title):
+        return right_title
+    return None
+
+
+def first_number(text: str) -> int | None:
+    match = re.match(r"\s*(\d+)[.、]", text)
+    return int(match.group(1)) if match else None
+
+
+def section_number_span(cells: list[Cell]) -> tuple[int | None, int | None]:
+    numbers = [number for cell in cells if (number := first_number(cell.text)) is not None]
+    if not numbers:
+        return None, None
+    return min(numbers), max(numbers)
+
+
+def should_continue_previous_flow(
+    cell: Cell,
+    current_title: Cell,
+    previous_title: Cell,
+    previous_cells: list[Cell],
+    current_images: list[ImageItem],
+) -> bool:
+    number = first_number(cell.text)
+    if number is None:
+        return False
+    if not current_images:
+        return False
+    first_image_row = min(image.from_row for image in current_images)
+    if cell.row >= first_image_row:
+        return False
+    _previous_min, previous_max = section_number_span(previous_cells)
+    if previous_max is None or number != previous_max + 1:
+        return False
+    previous_flow_cols = [item.start_col for item in previous_cells if item.start_col > previous_title.start_col]
+    if not previous_flow_cols:
+        return False
+    previous_flow_col = min(previous_flow_cols)
+    same_flow_col = abs(cell.start_col - previous_flow_col) <= 1
+    title_in_different_lane = current_title.start_col < previous_flow_col
+    return same_flow_col and title_in_different_lane
+
+
+def visual_section_for_cell(
+    cell: Cell,
+    assigned_title: Cell,
+    titles: list[Cell],
+    images_by_title: dict[str, list[ImageItem]],
+) -> Cell | None:
+    paired_left_visual_titles = [
+        title
+        for title in titles
+        if title.start_col < assigned_title.start_col
+        and abs(title.row - assigned_title.row) <= 2
+        and images_by_title.get(title.ref)
+    ]
+    if paired_left_visual_titles:
+        return None
+    earlier_left_visual_titles = [
+        title
+        for title in titles
+        if title.row < assigned_title.row
+        and title.start_col < assigned_title.start_col
+        and images_by_title.get(title.ref)
+    ]
+    if earlier_left_visual_titles:
+        return None
+
+    candidates = []
+    for title in titles:
+        if title.row > cell.start_row or title.row < assigned_title.row:
+            continue
+        if title.start_col >= cell.start_col:
+            continue
+        visual_images = [
+            image
+            for image in images_by_title.get(title.ref, [])
+            if image.from_col < cell.start_col and image.from_row <= cell.start_row <= image.to_row
+        ]
+        if not visual_images:
+            continue
+        candidates.append((title.row, max(image.to_row for image in visual_images), title.start_col, title))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    return candidates[-1][3]
+
+
+def cell_lines_for_row(row_cells: list[Cell]) -> list[tuple[int, str]]:
+    if not row_cells:
+        return []
+    cells = sorted(row_cells, key=lambda item: item.col)
+    groups: list[list[Cell]] = []
+    current: list[Cell] = []
+    for cell in cells:
+        if current and cell.start_col > current[-1].end_col + 1:
+            groups.append(current)
+            current = []
+        current.append(cell)
+    if current:
+        groups.append(current)
+    result = []
+    for group in groups:
+        text = " ".join(item.text for item in group if item.text).strip()
+        if text:
+            result.append((group[0].start_col, text))
+    return result
+
+
+def render_table(lines_by_row: list[tuple[int, list[tuple[int, str]]]]) -> list[str]:
+    lane_starts = sorted({start for _, items in lines_by_row for start, _ in items})
+    lane_map: dict[int, int] = {}
+    canonical: list[int] = []
+    for lane in lane_starts:
+        if canonical:
+            prev = canonical[-1]
+            appears_together = any(
+                {start for start, _ in items}.issuperset({prev, lane})
+                for _, items in lines_by_row
+            )
+            if lane == prev + 1 and not appears_together:
+                lane_map[lane] = prev
+                continue
+        lane_map[lane] = lane
+        canonical.append(lane)
+    anchor_items = next((items for _, items in lines_by_row if len(items) > 1), lines_by_row[0][1])
+    header_raw_starts = {start for start, _ in anchor_items}
+    header_lanes = {lane_map[start] for start in header_raw_starts}
+    continuation_map: dict[int, int] = {}
+    for lane in canonical:
+        if lane in header_lanes:
+            continue
+        previous_header_lanes = [item for item in canonical if item < lane and item in header_lanes]
+        paired_with_previous = sum(
+            1
+            for _, items in lines_by_row
+            if lane in {lane_map[start] for start, _ in items}
+            and any(
+                previous in {lane_map[start] for start, _ in items}
+                for previous in previous_header_lanes
+            )
+        )
+        if previous_header_lanes and paired_with_previous <= 1:
+            continuation_map[lane] = previous_header_lanes[-1]
+    lane_starts = [lane for lane in canonical if lane not in continuation_map]
+    rows = []
+    for _, items in lines_by_row:
+        by_lane: dict[int, str] = {}
+        for start, text in items:
+            lane = continuation_map.get(lane_map[start], lane_map[start])
+            by_lane[lane] = f"{by_lane[lane]} {text}".strip() if lane in by_lane else text
+        rows.append([by_lane.get(start, "") for start in lane_starts])
+    rows = align_leading_single_side_row(rows)
+    width = max(1, len(lane_starts))
+    output = [
+        "- | " + " | ".join("" for _ in range(width)) + " |",
+        "  | " + " | ".join("---" for _ in range(width)) + " |",
+    ]
+    for row in rows:
+        output.append("  | " + " | ".join(cell.replace("|", "\\|") for cell in row) + " |")
+    return output
+
+
+def align_leading_single_side_row(rows: list[list[str]]) -> list[list[str]]:
+    if len(rows) < 2 or len(rows[0]) < 2:
+        return rows
+    first = rows[0]
+    second = rows[1]
+    first_left_empty = not first[0]
+    first_right_only = any(first[1:])
+    second_has_left = bool(second[0])
+    second_has_right = any(second[1:])
+    if first_left_empty and first_right_only and second_has_left and second_has_right:
+        adjusted = [list(row) for row in rows]
+        adjusted[0][0] = adjusted[1][0]
+        adjusted[1][0] = ""
+        return adjusted
+    return rows
+
+
+def has_header_based_table(lines_by_row: list[tuple[int, list[tuple[int, str]]]]) -> bool:
+    if len(lines_by_row) < 2:
+        return False
+    _header_row, header_items = lines_by_row[0]
+    if len(header_items) < 2:
+        return False
+    if any(re.match(r"\s*(?:\d+(?:[.、\s]|$)|[▶>\-])", text.strip()) for _, text in header_items):
+        return False
+    header_starts = [start for start, _ in header_items]
+    content_rows = lines_by_row[1:]
+    if not any(items for _, items in content_rows):
+        return False
+
+    used_headers: set[int] = set()
+    for _row, items in content_rows:
+        for start, _text in items:
+            candidates = [header for header in header_starts if header <= start]
+            if not candidates:
+                return False
+            used_headers.add(candidates[-1])
+    return bool(used_headers)
+
+
+def table_shape_detected(lines_by_row: list[tuple[int, list[tuple[int, str]]]]) -> bool:
+    if not lines_by_row:
+        return False
+    lane_count = len({start for _, items in lines_by_row for start, _ in items})
+    multi_lane_rows = sum(1 for _, items in lines_by_row if len(items) > 1)
+    return (lane_count > 1 and multi_lane_rows >= 2) or has_header_based_table(lines_by_row)
+
+
+def row_clusters(lines_by_row: list[tuple[int, list[tuple[int, str]]]]) -> list[list[tuple[int, list[tuple[int, str]]]]]:
+    clusters: list[list[tuple[int, list[tuple[int, str]]]]] = []
+    for item in lines_by_row:
+        if clusters and item[0] == clusters[-1][-1][0] + 1:
+            clusters[-1].append(item)
+        else:
+            clusters.append([item])
+    return clusters
+
+
+def image_groups(images: list[ImageItem]) -> list[list[ImageItem]]:
+    groups: list[list[ImageItem]] = []
+    current: list[ImageItem] = []
+    current_end = -1
+    for image in sorted(images, key=lambda item: (item.from_row, item.from_col)):
+        if current and image.from_row > current_end:
+            groups.append(sorted(current, key=lambda item: item.from_col))
+            current = []
+        current.append(image)
+        current_end = max(current_end, image.to_row)
+    if current:
+        groups.append(sorted(current, key=lambda item: item.from_col))
+    return groups
+
+
+def image_column_groups(images: list[ImageItem]) -> list[list[ImageItem]]:
+    groups: list[list[ImageItem]] = []
+    for image in sorted(images, key=lambda item: (item.from_col, item.from_row)):
+        placed = False
+        for group in groups:
+            group_left = min(item.from_col for item in group)
+            group_right = max(item.to_col for item in group)
+            if horizontal_overlap(image.from_col, image.to_col, group_left, group_right) > 0:
+                group.append(image)
+                placed = True
+                break
+        if not placed:
+            groups.append([image])
+    return [sorted(group, key=lambda item: (item.from_row, item.from_col)) for group in groups]
+
+
+def leading_visual_image_group(
+    rows: list[tuple[int, list[tuple[int, str]]]],
+    images: list[ImageItem],
+) -> list[ImageItem]:
+    if len(images) < 2 or not rows:
+        return []
+    text_cols = [start for _, items in rows for start, _ in items]
+    if not text_cols:
+        return []
+    min_text_col = min(text_cols)
+    candidates = []
+    for group in image_column_groups(images):
+        if len(group) < 2 or max(image.to_col for image in group) >= min_text_col:
+            continue
+        restart = False
+        for image in group[1:]:
+            nearby_rows = [
+                item
+                for item in rows
+                if image.from_row - 1 <= item[0] <= image.from_row + 1
+                and any(start > image.to_col for start, _ in item[1])
+            ]
+            if any(
+                first_number(text) == 1
+                for _, items in nearby_rows
+                for _, text in items
+            ):
+                restart = True
+                break
+        if not restart:
+            candidates.append(group)
+    if not candidates:
+        return []
+    return max(
+        candidates,
+        key=lambda group: (
+            len(group),
+            max(image.to_row for image in group) - min(image.from_row for image in group),
+            -min(image.from_col for image in group),
+        ),
+    )
+
+
+def has_repeated_short_label(cells: list[Cell], row_start: int, row_end: int) -> bool:
+    by_row: dict[int, dict[str, int]] = {}
+    for cell in cells:
+        if not (row_start <= cell.row <= row_end):
+            continue
+        text = cell.text.strip()
+        if len(text) > 20:
+            continue
+        by_row.setdefault(cell.row, {})[text] = by_row.setdefault(cell.row, {}).get(text, 0) + 1
+    return any(count >= 2 for counts in by_row.values() for count in counts.values())
+
+
+def cell_center_col(cell: Cell) -> float:
+    return (cell.start_col + cell.end_col) / 2
+
+
+def image_center_col(image: ImageItem) -> float:
+    return (image.from_col + image.to_col) / 2
+
+
+def horizontally_contains_cell(image: ImageItem, cell: Cell) -> bool:
+    center = cell_center_col(cell)
+    return image.from_col <= center <= image.to_col
+
+
+def has_aligned_caption_row(cells: list[Cell], group: list[ImageItem]) -> bool:
+    group_start = min(image.from_row for image in group)
+    before_by_row: dict[int, list[Cell]] = {}
+    for cell in cells:
+        if cell.row >= group_start:
+            continue
+        before_by_row.setdefault(cell.row, []).append(cell)
+
+    for row_cells in before_by_row.values():
+        image_indexes: set[int] = set()
+        for cell in row_cells:
+            aligned_images = [
+                image
+                for image in group
+                if horizontally_contains_cell(image, cell)
+            ]
+            if not aligned_images:
+                continue
+            image = min(
+                aligned_images,
+                key=lambda item: abs(cell_center_col(cell) - image_center_col(item)),
+            )
+            image_indexes.add(image.index)
+        if len(image_indexes) >= 2:
+            return True
+    return False
+
+
+def is_label_text(text: str) -> bool:
+    return text.strip().endswith((":", "："))
+
+
+def use_card_rendering(cells: list[Cell], images: list[ImageItem]) -> bool:
+    for group in image_groups(images):
+        if len(group) < 2:
+            continue
+        row_start = min(image.from_row for image in group)
+        row_end = max(image.to_row for image in group)
+        if has_repeated_short_label(cells, row_start, row_end):
+            return True
+        if has_aligned_caption_row(cells, group):
+            return True
+    return False
+
+
+def nearest_image(cell: Cell, images: list[ImageItem]) -> ImageItem:
+    center = cell_center_col(cell)
+    return min(
+        images,
+        key=lambda image: (
+            abs(center - image_center_col(image)),
+            abs(cell.row - image.from_row),
+            image.from_col,
+        ),
+    )
+
+
+def emphasized_group_heading_row(
+    before_cells: list[Cell],
+    title_start: int | None,
+    section_left: int,
+    styles: dict[str, dict],
+) -> int | None:
+    if title_start is None:
+        return None
+    rows = sorted({cell.row for cell in before_cells if cell.row < title_start})
+    for row in reversed(rows):
+        row_cells = [cell for cell in before_cells if cell.row == row]
+        if len(row_cells) != 1:
+            continue
+        cell = row_cells[0]
+        style = styles.get(cell.style or "", {})
+        emphasized = bool(style.get("bold")) or bool(style.get("filled"))
+        if emphasized and cell.start_col == section_left and not is_label_text(cell.text):
+            return row
+    return None
+
+
+def render_card_section(cells: list[Cell], images: list[ImageItem], styles: dict[str, dict]) -> list[str]:
+    output: list[str] = []
+    consumed_rows: set[int] = set()
+    groups = image_groups(images)
+    previous_group_end = -1
+    section_left = min((cell.start_col for cell in cells), default=1)
+
+    for group in groups:
+        group_start = min(image.from_row for image in group)
+        group_end = max(image.to_row for image in group)
+        before_cells = [
+            cell
+            for cell in cells
+            if previous_group_end < cell.row < group_start and cell.row not in consumed_rows
+        ]
+        candidate_rows = sorted({cell.row for cell in before_cells})
+        title_start: int | None = None
+        for row in candidate_rows:
+            if sum(1 for cell in before_cells if cell.row == row) >= 2:
+                title_start = row
+        if title_start is None and candidate_rows:
+            title_start = candidate_rows[-1]
+
+        group_heading_row = emphasized_group_heading_row(before_cells, title_start, section_left, styles)
+        if title_start is not None:
+            pre_rows: dict[int, list[Cell]] = {}
+            for cell in before_cells:
+                if cell.row < title_start and cell.row != group_heading_row:
+                    pre_rows.setdefault(cell.row, []).append(cell)
+            pre_lines = [(row, cell_lines_for_row(row_cells)) for row, row_cells in sorted(pre_rows.items())]
+            pre_lines = [(row, items) for row, items in pre_lines if items]
+            output.extend(render_rows(pre_lines))
+            if pre_lines:
+                output.append("")
+            if group_heading_row is not None:
+                heading_cells = [cell for cell in before_cells if cell.row == group_heading_row]
+                output.append(f"## {heading_cells[0].text}")
+                output.append("")
+                consumed_rows.add(group_heading_row)
+
+        title_cells: dict[int, list[Cell]] = {image.index: [] for image in group}
+        if title_start is not None:
+            for cell in before_cells:
+                if title_start <= cell.row < group_start:
+                    title_cells[nearest_image(cell, group).index].append(cell)
+                    consumed_rows.add(cell.row)
+
+        prop_cells: dict[int, list[Cell]] = {image.index: [] for image in group}
+        for cell in cells:
+            if not (group_start <= cell.row <= group_end):
+                continue
+            assigned_image = nearest_image(cell, group)
+            if cell.row < assigned_image.from_row and not is_label_text(cell.text):
+                title_cells[assigned_image.index].append(cell)
+            else:
+                prop_cells[assigned_image.index].append(cell)
+            consumed_rows.add(cell.row)
+
+        for image in group:
+            heading_cells = sorted(title_cells.get(image.index, []), key=lambda item: (item.row, item.col))
+            heading = " / ".join(dict.fromkeys(cell.text for cell in heading_cells))
+            if heading:
+                output.append(f"### {heading}")
+                output.append("")
+            output.append(f"- ![image {image.index}](./{image.path})")
+            props_by_row: dict[int, list[Cell]] = {}
+            for cell in sorted(prop_cells.get(image.index, []), key=lambda item: (item.row, item.col)):
+                props_by_row.setdefault(cell.row, []).append(cell)
+            prop_lines = [(row, cell_lines_for_row(row_cells)) for row, row_cells in sorted(props_by_row.items())]
+            prop_lines = [(row, items) for row, items in prop_lines if items]
+            if prop_lines:
+                output.append("")
+                output.extend(render_rows(prop_lines))
+            output.append("")
+
+        previous_group_end = group_end
+
+    after_cells = [cell for cell in cells if cell.row > previous_group_end and cell.row not in consumed_rows]
+    after_rows: dict[int, list[Cell]] = {}
+    for cell in after_cells:
+        after_rows.setdefault(cell.row, []).append(cell)
+    after_lines = [(row, cell_lines_for_row(row_cells)) for row, row_cells in sorted(after_rows.items())]
+    after_lines = [(row, items) for row, items in after_lines if items]
+    output.extend(render_rows(after_lines))
+
+    compacted: list[str] = []
+    for line in output:
+        if line == "" and compacted and compacted[-1] == "":
+            continue
+        compacted.append(line)
+    while compacted and compacted[-1] == "":
+        compacted.pop()
+    return compacted
+
+
+def visual_group_start(image: ImageItem, rows: list[tuple[int, list[tuple[int, str]]]]) -> int:
+    for cluster in row_clusters(rows):
+        cluster_start = cluster[0][0]
+        cluster_end = cluster[-1][0]
+        min_text_col = min(start for _, items in cluster for start, _ in items)
+        max_text_col = max(start for _, items in cluster for start, _ in items)
+        touches_left_edge = image.to_col == min_text_col and max_text_col > image.to_col
+        visually_left = image.to_col < min_text_col or touches_left_edge
+        vertically_related = cluster_start <= image.to_row and cluster_end >= image.from_row
+        if visually_left and vertically_related:
+            previous_rows = [item for item in rows if item[0] < cluster_start]
+            if previous_rows and rows_render_as_table(cluster):
+                previous_cluster = row_clusters(previous_rows)[-1]
+                combined_cluster = previous_cluster + cluster
+                previous_cols = [start for _, items in previous_cluster for start, _ in items]
+                same_table_band = (
+                    previous_cols
+                    and rows_render_as_table(combined_cluster)
+                    and min(previous_cols) >= min_text_col
+                    and max(previous_cols) <= max_text_col
+                )
+                if same_table_band:
+                    return previous_cluster[0][0]
+            if previous_rows and rows_render_as_table(cluster):
+                header_row, header_items = previous_rows[-1]
+                no_intervening_text = all(
+                    row == header_row or row >= cluster_start
+                    for row, _ in rows
+                    if row < cluster_start
+                )
+                header_in_table_band = (
+                    header_row < image.from_row
+                    and no_intervening_text
+                    and len(header_items) > 1
+                    and all(min_text_col <= start <= max_text_col for start, _ in header_items)
+                )
+                if header_in_table_band:
+                    return header_row
+            return cluster_start
+    return image.from_row
+
+
+def side_note_cluster(
+    image: ImageItem,
+    rows: list[tuple[int, list[tuple[int, str]]]],
+) -> list[tuple[int, list[tuple[int, str]]]] | None:
+    for cluster in row_clusters(rows):
+        cluster_start = cluster[0][0]
+        cluster_end = cluster[-1][0]
+        max_text_col = max(start for _, items in cluster for start, _ in items)
+        visually_right = image.from_col > max_text_col
+        vertically_related = cluster_start <= image.to_row and cluster_end >= image.from_row
+        if visually_right and vertically_related:
+            return cluster
+    return None
+
+
+def append_suffix(text: str, suffix: str | None) -> str:
+    return f"{text} {suffix}".strip() if suffix else text
+
+
+def render_rows(
+    lines_by_row: list[tuple[int, list[tuple[int, str]]]],
+    row_suffixes: dict[int, str] | None = None,
+) -> list[str]:
+    if not lines_by_row:
+        return []
+    row_suffixes = row_suffixes or {}
+    if table_shape_detected(lines_by_row):
+        if row_suffixes:
+            adjusted: list[tuple[int, list[tuple[int, str]]]] = []
+            for row, items in lines_by_row:
+                suffix = row_suffixes.get(row)
+                if suffix and items:
+                    adjusted_items = list(items)
+                    start, text = adjusted_items[-1]
+                    adjusted_items[-1] = (start, append_suffix(text, suffix))
+                    adjusted.append((row, adjusted_items))
+                else:
+                    adjusted.append((row, items))
+            lines_by_row = adjusted
+        return render_table(lines_by_row)
+    output = []
+    for row, items in lines_by_row:
+        for _, text in items:
+            output.append(f"- {append_suffix(text, row_suffixes.get(row))}")
+    return output
+
+
+def rows_render_as_table(lines_by_row: list[tuple[int, list[tuple[int, str]]]]) -> bool:
+    return table_shape_detected(lines_by_row)
+
+
+def below_auxiliary_target_row(
+    image_group: list[ImageItem],
+    before_rows: list[tuple[int, list[tuple[int, str]]]],
+) -> int | None:
+    if not before_rows:
+        return None
+    group_left = min(image.from_col for image in image_group)
+    group_right = max(image.to_col for image in image_group)
+    candidates = []
+    for row, items in before_rows:
+        item_cols = [start for start, _ in items]
+        if not item_cols:
+            continue
+        same_or_near_flow = any(start <= group_right + 1 for start in item_cols)
+        if same_or_near_flow:
+            candidates.append(row)
+    return candidates[-1] if candidates else None
+
+
+def detached_image_heading(
+    image_group: list[ImageItem],
+    before_rows: list[tuple[int, list[tuple[int, str]]]],
+) -> tuple[
+    str | None,
+    list[tuple[int, list[tuple[int, str]]]],
+    tuple[int, list[tuple[int, str]]] | None,
+]:
+    if not before_rows:
+        return None, before_rows, None
+    image_start = min(image.from_row for image in image_group)
+    row, items = before_rows[-1]
+    if row != image_start - 1 or len(items) < 2:
+        return None, before_rows, None
+    group_left = min(image.from_col for image in image_group)
+    group_right = max(image.to_col for image in image_group)
+    sorted_items = sorted(items, key=lambda item: item[0])
+    left_start, left_text = sorted_items[0]
+    if left_start >= group_left:
+        return None, before_rows, None
+    other_starts = [start for start, _ in sorted_items[1:]]
+    if not other_starts or min(other_starts) <= group_right:
+        return None, before_rows, None
+    if re.match(r"\s*(?:\d+(?:[.、\s]|$)|[▶>\-])", left_text.strip()):
+        return None, before_rows, None
+    remaining = [(start, text) for start, text in items if (start, text) != (left_start, left_text)]
+    adjusted_before = list(before_rows[:-1])
+    carry_row = (row, remaining) if remaining else None
+    return left_text.strip(), adjusted_before, carry_row
+
+
+def detached_image_heading_row(
+    image_group: list[ImageItem],
+    rows: list[tuple[int, list[tuple[int, str]]]],
+) -> int | None:
+    heading, _adjusted, _carry = detached_image_heading(
+        image_group,
+        [item for item in rows if item[0] < min(image.from_row for image in image_group)],
+    )
+    if not heading:
+        return None
+    return min(image.from_row for image in image_group) - 1
+
+
+def previous_output_is_list_item(output: list[str]) -> bool:
+    for line in reversed(output):
+        if not line:
+            continue
+        return line.startswith("- ")
+    return False
+
+
+def append_list_image_item(output: list[str], image_line: str) -> None:
+    if output and output[-1] == "":
+        previous = next((line for line in reversed(output[:-1]) if line), "")
+        if previous.startswith("- "):
+            output.pop()
+    output.append(f"- {image_line}")
+
+
+def append_nested_image_item(output: list[str], heading: str, image_line: str) -> None:
+    if output and output[-1] == "":
+        previous = next((line for line in reversed(output[:-1]) if line), "")
+        if previous.startswith("- "):
+            output.pop()
+    output.append(f"- **{heading}**")
+    output.append(f"  - {image_line}")
+
+
+def split_rows_for_images(
+    lines_by_row: list[tuple[int, list[tuple[int, str]]]],
+    images: list[ImageItem],
+) -> list[str]:
+    output: list[str] = []
+    rows = list(lines_by_row)
+    leading_group = leading_visual_image_group(rows, images)
+    if leading_group:
+        consumed = {image.index for image in leading_group}
+        for row_group in image_groups(leading_group):
+            append_list_image_item(output, " ".join(f"![image {item.index}](./{item.path})" for item in row_group))
+            output.append("")
+        images = [image for image in images if image.index not in consumed]
+    image_queue = sorted(images, key=lambda item: (item.from_row, item.from_col))
+
+    while rows or image_queue:
+        if not image_queue:
+            output.extend(render_rows(rows))
+            break
+        image = image_queue.pop(0)
+        image_group = [image]
+        while image_queue and image_queue[0].from_row == image.from_row:
+            candidate = image_queue.pop(0)
+            image_group.append(candidate)
+        group_start = visual_group_start(image, rows)
+        before = [item for item in rows if item[0] < group_start]
+        after_or_same = [item for item in rows if item[0] >= group_start]
+        image_heading, before, carry_row = detached_image_heading(image_group, before)
+        if before:
+            output.extend(render_rows(before))
+            rows = after_or_same
+        elif carry_row is not None:
+            rows = after_or_same
+        side_cluster = side_note_cluster(image, rows)
+        if side_cluster:
+            side_rows = {row for row, _ in side_cluster}
+            row_suffixes = {
+                image.from_row: " ".join(f"![image {item.index}](./{item.path})" for item in image_group)
+            }
+            output.extend(render_rows(side_cluster, row_suffixes))
+            rows = [item for item in rows if item[0] not in side_rows]
+            output.append("")
+        else:
+            target_row = below_auxiliary_target_row(image_group, before)
+            image_line = " ".join(f"![image {item.index}](./{item.path})" for item in image_group)
+            if target_row is not None and before:
+                append_list_image_item(output, image_line)
+                rows = after_or_same
+            else:
+                if image_heading:
+                    if output and output[-1] != "":
+                        output.append("")
+                    output.append(f"### {image_heading}")
+                    output.append("")
+                if before and not rows_render_as_table(before):
+                    append_list_image_item(output, image_line)
+                elif (
+                    not before
+                    and len(image_group) >= 2
+                    and rows
+                    and previous_output_is_list_item(output)
+                ):
+                    append_list_image_item(output, image_line)
+                else:
+                    if before and output and output[-1] != "":
+                        output.append("")
+                    append_list_image_item(output, image_line)
+                    output.append("")
+                    if image_queue:
+                        next_image = image_queue[0]
+                        next_group_start = visual_group_start(next_image, rows)
+                        next_before = [item for item in rows if item[0] < next_group_start]
+                        next_heading, adjusted_next_before, next_carry = detached_image_heading([next_image], next_before)
+                        if next_heading:
+                            next_image_group = [image_queue.pop(0)]
+                            while image_queue and image_queue[0].from_row == next_image.from_row:
+                                next_image_group.append(image_queue.pop(0))
+                            next_next_group_start = visual_group_start(image_queue[0], rows) if image_queue else 999999
+                            group = list(adjusted_next_before)
+                            if next_carry is not None:
+                                group.append(next_carry)
+                            group.extend(item for item in rows if next_group_start <= item[0] < next_next_group_start)
+                            rows = [item for item in rows if item[0] >= next_next_group_start]
+                            append_nested_image_item(
+                                output,
+                                next_heading,
+                                " ".join(f"![image {item.index}](./{item.path})" for item in next_image_group),
+                            )
+                            if group:
+                                output.append("")
+                            output.extend(render_rows(group))
+                            if rows:
+                                output.append("")
+                            continue
+                next_group_start = visual_group_start(image_queue[0], rows) if image_queue else 999999
+                if image_queue:
+                    next_heading_row = detached_image_heading_row([image_queue[0]], rows)
+                    if next_heading_row is not None:
+                        next_group_start = min(next_group_start, next_heading_row)
+                group = [item for item in rows if item[0] < next_group_start]
+                if carry_row is not None:
+                    group = [carry_row] + group
+                rows = [item for item in rows if item[0] >= next_group_start]
+                output.extend(render_rows(group))
+                if rows:
+                    output.append("")
+
+    compacted: list[str] = []
+    for line in output:
+        if line == "" and compacted and compacted[-1] == "":
+            continue
+        compacted.append(line)
+    output = compacted
+    while output and output[-1] == "":
+        output.pop()
+    return output
+
+
+def safe_dir_name(name: str) -> str:
+    stem = Path(name).stem
+    return re.sub(r'[<>:"/\\|?*【】]+', "_", stem).strip("_")
+
+
+def parse_md_list() -> list[str]:
+    text = MD_LIST.read_text(encoding="utf-8")
+    in_input_list = False
+    files = []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            in_input_list = line.strip() in ("## 已验收需保护", "## 未纳入保护")
+            continue
+        if not in_input_list:
+            continue
+        match = re.match(r"- `(.+?\.xlsx)`", line.strip())
+        if match:
+            files.append(match.group(1))
+    return files
+
+
+def parse_one(path: Path, output_dir: Path) -> dict:
+    with zipfile.ZipFile(path) as zf:
+        _sheet_name, sheet_path = select_sheet(zf)
+        shared = read_shared_strings(zf)
+        styles = read_styles(zf)
+        root = ET.fromstring(zf.read(sheet_path))
+        cells = parse_cells(root, shared, read_merged_ranges(root))
+        titles = detect_titles(cells, styles)
+        lanes = title_lanes(titles)
+        images = drawing_images(zf, sheet_path, output_dir)
+
+    title_key = lambda title: title.ref
+    sections = {title_key(title): {"title": title, "cells": [], "images": []} for title in titles}
+    images_by_title: dict[str, list[ImageItem]] = {title_key(title): [] for title in titles}
+    for image in images:
+        title = assign_to_title(image.from_row, image.from_col, image.to_col, titles, lanes)
+        if title is not None:
+            images_by_title[title_key(title)].append(image)
+    redirected_flows: dict[str, tuple[Cell, int]] = {}
+    for cell in cells:
+        if cell.is_title:
+            continue
+        title = assign_to_title(cell.start_row, cell.start_col, cell.end_col, titles, lanes)
+        if title is not None:
+            right_title = adjacent_right_title_for_cell(cell, title, titles)
+            if right_title is not None:
+                title = right_title
+            visual_title = visual_section_for_cell(cell, title, titles, images_by_title)
+            if visual_title is not None:
+                title = visual_title
+            title_index = titles.index(title)
+            redirect = redirected_flows.get(title_key(title))
+            if redirect and cell.start_col >= redirect[1]:
+                title = redirect[0]
+            elif title_index > 0:
+                previous_title = titles[title_index - 1]
+                previous_cells = sections[title_key(previous_title)]["cells"]
+                if should_continue_previous_flow(
+                    cell,
+                    title,
+                    previous_title,
+                    previous_cells,
+                    images_by_title.get(title_key(title), []),
+                ):
+                    previous_flow_cols = [
+                        item.start_col
+                        for item in previous_cells
+                        if item.start_col > previous_title.start_col
+                    ]
+                    flow_col = min(previous_flow_cols) if previous_flow_cols else cell.start_col
+                    redirected_flows[title_key(title)] = (previous_title, flow_col)
+                    title = previous_title
+            sections[title_key(title)]["cells"].append(cell)
+    for title in titles:
+        sections[title_key(title)]["images"].extend(images_by_title[title_key(title)])
+
+    lines = [f"# {path.name}", ""]
+    for title in titles:
+        section = sections[title_key(title)]
+        lines.append(f"## {title.text}")
+        lines.append("")
+        rows: dict[int, list[Cell]] = {}
+        for cell in section["cells"]:
+            rows.setdefault(cell.row, []).append(cell)
+        lines_by_row = [(row, cell_lines_for_row(row_cells)) for row, row_cells in sorted(rows.items())]
+        lines_by_row = [(row, items) for row, items in lines_by_row if items]
+        if use_card_rendering(section["cells"], section["images"]):
+            body = render_card_section(section["cells"], section["images"], styles)
+        else:
+            body = split_rows_for_images(lines_by_row, section["images"])
+        if body:
+            lines.extend(body)
+            lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
+    (output_dir / "extract.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {
+        "file": path.name,
+        "xlsx": str(path),
+        "output": str((output_dir / "extract.md").relative_to(ROOT)),
+        "warnings": [],
+    }
+
+
+def main() -> int:
+    files = parse_md_list()
+    if OUTPUT_ROOT.exists():
+        shutil.rmtree(OUTPUT_ROOT)
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    items = []
+    missing = []
+    warnings = []
+    for file_name in files:
+        source = SOURCE_ROOT / file_name
+        if not source.exists():
+            missing.append(file_name)
+            continue
+        out_dir = OUTPUT_ROOT / safe_dir_name(file_name)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            items.append(parse_one(source, out_dir))
+        except Exception as exc:
+            warnings.append(f"{file_name}: {exc}")
+
+    (OUTPUT_ROOT / "outputs.txt").write_text(
+        "\n".join(item["output"] for item in items) + ("\n" if items else ""),
+        encoding="utf-8",
+    )
+    summary_lines = [
+        "# Markdown 输出摘要",
+        "",
+        f"- 生成数量：{len(items)}",
+        f"- 缺失数量：{len(missing)}",
+        f"- 警告数量：{len(warnings)}",
+        "",
+        "## 输出文件",
+        "",
+    ]
+    summary_lines.extend(f"- `{item['output']}`" for item in items)
+    if missing:
+        summary_lines.extend(["", "## 缺失文件", ""])
+        summary_lines.extend(f"- `{item}`" for item in missing)
+    if warnings:
+        summary_lines.extend(["", "## 警告", ""])
+        summary_lines.extend(f"- {item}" for item in warnings)
+    (OUTPUT_ROOT / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    print(f"generated={len(items)} missing={len(missing)} warnings={len(warnings)}")
+    if warnings:
+        print("\n".join(warnings), file=sys.stderr)
+    return 1 if missing or warnings else 0
+
+
+if __name__ == "__main__":
+    configure_stdio()
+    raise SystemExit(main())
